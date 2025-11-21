@@ -32,3 +32,18 @@ Hyper-optimized evaluation harness for vision-language benchmarks using Triton.
   python vlmeval_bench.py --preset molmo-7b --datasets MME,TextVQA --batch-size 4
   ```
   Adjust `--datasets` to any VLMEvalKit dataset name (e.g., GQA, MMVet, MathVista).
+
+## Install as a package
+- Editable dev install:
+  ```
+  pip install -e .
+  ```
+- With VLMEvalKit extra:
+  ```
+  pip install -e ".[eval]"
+  ```
+- Then import anywhere:
+  ```python
+  import vibecheck
+  evaluator = vibecheck.accelerate(model, tokenizer)
+  ```
