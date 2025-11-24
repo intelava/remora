@@ -3,10 +3,15 @@ Preset model loader utilities.
 """
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
-from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForVision2Seq,
+    AutoProcessor,
+    AutoTokenizer,
+)
 
 
 @dataclass
@@ -16,6 +21,7 @@ class ModelSpec:
     description: str
     supports_vision: bool = True
     trust_remote_code: bool = True
+    model_loader: Optional[Callable[..., torch.nn.Module]] = None
 
 
 MODEL_PRESETS: Dict[str, ModelSpec] = {
@@ -30,6 +36,7 @@ MODEL_PRESETS: Dict[str, ModelSpec] = {
         tokenizer_id="HuggingFaceTB/SmolVLM-Base",
         supports_vision=True,
         description="SmolVLM Base vision-language model",
+        model_loader=AutoModelForVision2Seq.from_pretrained,
     ),
     "qwen2.5-vl-7b": ModelSpec(
         model_id="Qwen/Qwen2.5-VL-7B-Instruct",
@@ -50,7 +57,8 @@ def load_model_and_tokenizer(
     if preset not in MODEL_PRESETS:
         raise ValueError(f"Unknown preset '{preset}'. Available: {', '.join(MODEL_PRESETS.keys())}")
     spec = MODEL_PRESETS[preset]
-    model = AutoModelForCausalLM.from_pretrained(
+    model_fn = spec.model_loader or AutoModelForCausalLM.from_pretrained
+    model = model_fn(
         spec.model_id,
         trust_remote_code=spec.trust_remote_code,
     )
