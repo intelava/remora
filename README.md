@@ -11,7 +11,8 @@ Hyper-optimized evaluation harness for vision-language benchmarks using Triton.
 - Wrap for VLMEvalKit:
   ```python
   from remora.integration import VibeCheckModel
-  vibe = VibeCheckModel(model, tokenizer)
+  with VibeCheckModel(model, tokenizer) as vibe:
+      ...
   ```
 - Run a quick TPS comparison: `python run_eval.py --model-path /path/to/model`.
 
@@ -32,6 +33,10 @@ Hyper-optimized evaluation harness for vision-language benchmarks using Triton.
   python vlmeval_bench.py --preset molmo-7b --datasets MME,TextVQA --batch-size 4
   ```
   Adjust `--datasets` to any VLMEvalKit dataset name (e.g., GQA, MMVet, MathVista).
+- Discover presets without editing code: `python vlmeval_bench.py --list-presets`.
+- Override hardware or avoid surgery: `python vlmeval_bench.py --device cpu --no-surgery`.
+- Tune batching from the CLI: `--batch-size`, `--flush-ms`, and `--max-queue` control how aggressively requests are coalesced.
+- Narrow surgery targets if needed: `--surgery-include decoder.layers.0,attention`.
 
 ## Install as a package
 - Editable dev install:

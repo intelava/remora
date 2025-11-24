@@ -58,6 +58,12 @@ class VibeCheckModel(CustomLLM):
         self._worker = threading.Thread(target=self._drain_loop, daemon=True)
         self._worker.start()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
     # Public API expected by VLMEvalKit ------------------------------------
     def generate(self, prompt: str, image: Any = None, **kwargs) -> str:
         fut = self._enqueue(prompt, image=image, kwargs=kwargs)
@@ -71,8 +77,12 @@ class VibeCheckModel(CustomLLM):
     # Internal worker ------------------------------------------------------
     def _enqueue(self, prompt: str, image: Any, kwargs: Dict[str, Any], flush_now: bool = False) -> Future:
         with self._cv:
+            if self._closed:
+                raise RuntimeError("VibeCheckModel has been closed and cannot accept new work.")
             while len(self._queue) >= self.max_queue and not self._closed:
                 self._cv.wait(timeout=0.001)
+            if self._closed:
+                raise RuntimeError("VibeCheckModel has been closed and cannot accept new work.")
             payload = dict(kwargs) if kwargs else {}
             fut: Future = Future()
             tokenizer_kwargs = payload.pop("tokenizer_kwargs", {})
@@ -94,12 +104,18 @@ class VibeCheckModel(CustomLLM):
         return fut
 
     def _drain_loop(self):
-        while not self._closed:
+        while True:
             batch: List[_QueuedRequest] = []
             with self._cv:
                 if not self._queue:
                     self._cv.wait(timeout=self.flush_ms / 1000.0)
-                elif len(self._queue) < self.batch_size:
+                if not self._queue and self._closed:
+                    break
+                if (
+                    not self._closed
+                    and self._queue
+                    and len(self._queue) < self.batch_size
+                ):
                     # Delay slightly to allow sequential callers to accumulate into a batch.
                     self._cv.wait(timeout=self.flush_ms / 1000.0)
                 while self._queue and len(batch) < self.batch_size:
@@ -109,24 +125,40 @@ class VibeCheckModel(CustomLLM):
             if not batch:
                 continue
 
-            gen_reqs = [
-                GenerationRequest(
-                    prompt=req.prompt,
-                    vision=req.vision,
-                    tokenizer_kwargs=req.tokenizer_kwargs,
-                    generate_kwargs=req.generate_kwargs,
-                    vision_key=req.vision_key,
-                )
-                for req in batch
-            ]
-            results = self.engine.generate_batch(gen_reqs)
-            for i, req in enumerate(batch):
-                out = results.get(i, {})
-                if not req.future.cancelled():
-                    req.future.set_result(out.get("text", ""))
+            try:
+                gen_reqs = [
+                    GenerationRequest(
+                        prompt=req.prompt,
+                        vision=req.vision,
+                        tokenizer_kwargs=req.tokenizer_kwargs,
+                        generate_kwargs=req.generate_kwargs,
+                        vision_key=req.vision_key,
+                    )
+                    for req in batch
+                ]
+                results = self.engine.generate_batch(gen_reqs)
+            except Exception as exc:
+                for req in batch:
+                    if not req.future.cancelled():
+                        req.future.set_exception(exc)
+                continue
 
-    def close(self):
+            for i, req in enumerate(batch):
+                if req.future.cancelled():
+                    continue
+                out = results.get(i)
+                if out is None:
+                    req.future.set_exception(RuntimeError(f"Missing generation output for batch index {i}."))
+                    continue
+                req.future.set_result(out.get("text", ""))
+
+    def close(self, cancel_pending: bool = False, timeout: float = 0.5):
         self._closed = True
         with self._cv:
+            if cancel_pending:
+                while self._queue:
+                    req = self._queue.popleft()
+                    if not req.future.done():
+                        req.future.cancel()
             self._cv.notify_all()
-        self._worker.join(timeout=0.1)
+        self._worker.join(timeout=timeout)

@@ -7,9 +7,9 @@ python vlmeval_bench.py --preset molmo-7b --datasets MME,TextVQA --batch-size 4
 """
 
 import argparse
-import inspect
 import os
 import sys
+import subprocess
 from typing import List
 
 import torch
@@ -24,32 +24,42 @@ def _run_vlmeval(vibe_model: VibeCheckModel, datasets: List[str], output_dir: st
     Best-effort wrapper that calls VLMEvalKit's run_eval if available. This keeps
     all configuration in Python so users can tweak without shelling out.
     """
-    try:
-        from vlmeval.api import run_eval  # type: ignore
-    except Exception as exc:
-        raise SystemExit(
-            "vlmeval is required for this script. Install via `pip install vlmeval`."
-        ) from exc
+    run_eval = None
+    for path in ("vlmeval.api", "vlmeval.evaluate", "vlmeval"):
+        try:
+            module = __import__(path, fromlist=["run_eval"])
+            run_eval = getattr(module, "run_eval", None)
+            if run_eval is not None:
+                break
+        except Exception as exc:  # pragma: no cover - defensive
+            import_error = exc
+            continue
 
-    sig = inspect.signature(run_eval)
-    params = sig.parameters
-    call_kwargs = {}
-    if "model" in params:
-        call_kwargs["model"] = vibe_model
-    elif "llm" in params:
-        call_kwargs["llm"] = vibe_model
-    if "datasets" in params:
-        call_kwargs["datasets"] = datasets
-    if "save_dir" in params:
-        call_kwargs["save_dir"] = output_dir
-    if "out_dir" in params:
-        call_kwargs["out_dir"] = output_dir
-    if "num_workers" in params and "num_workers" in kwargs:
-        call_kwargs["num_workers"] = kwargs["num_workers"]
-    if "root" in params and "root" in kwargs:
-        call_kwargs["root"] = kwargs["root"]
+    if run_eval is None:
+        # CLI fallback: call `python -m vlmeval.evaluate ...`
+        cmd = [
+            sys.executable,
+            "-m",
+            "vlmeval.evaluate",
+            "--model",
+            "vibecheck",
+            "--datasets",
+            ",".join(datasets),
+            "--save_dir",
+            output_dir,
+        ]
+        if "num_workers" in kwargs:
+            cmd.extend(["--num_workers", str(kwargs["num_workers"])])
+        print(f"[remora] Falling back to VLMEvalKit CLI: {' '.join(cmd)}")
+        subprocess.run(cmd, check=True)
+        return None
 
-    return run_eval(**call_kwargs)
+    return run_eval(
+        model=vibe_model,
+        datasets=datasets,
+        save_dir=output_dir,
+        num_workers=kwargs.get("num_workers", 1),
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +72,11 @@ def parse_args() -> argparse.Namespace:
         help="Preset model alias to load.",
     )
     parser.add_argument(
+        "--list-presets",
+        action="store_true",
+        help="List available presets and exit.",
+    )
+    parser.add_argument(
         "--datasets",
         type=str,
         default="MME",
@@ -69,6 +84,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size for VibeCheck queue.")
     parser.add_argument("--flush-ms", type=float, default=10.0, help="Flush interval for the batching queue.")
+    parser.add_argument("--max-queue", type=int, default=64, help="Maximum buffered requests before throttling.")
+    parser.add_argument(
+        "--device",
+        type=str,
+        help="Device override (e.g., cpu, cuda, cuda:0). Defaults to CUDA if available.",
+    )
+    parser.add_argument(
+        "--no-surgery",
+        action="store_true",
+        help="Skip Triton surgery (keep stock nn.Linear layers).",
+    )
+    parser.add_argument(
+        "--surgery-include",
+        type=str,
+        help="Comma-separated substrings limiting which Linear layers are swapped.",
+    )
     parser.add_argument("--output-dir", type=str, default="outputs", help="Result directory for VLMEvalKit.")
     parser.add_argument("--num-workers", type=int, default=1, help="VLMEvalKit worker threads.")
     return parser.parse_args()
@@ -76,21 +107,44 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.list_presets:
+        print("Available presets:")
+        for name, spec in MODEL_PRESETS.items():
+            print(f"- {name}: {spec.description}")
+        return
+
+    if args.device:
+        try:
+            torch.device(args.device)
+        except Exception as exc:
+            raise SystemExit(f"Invalid --device '{args.device}': {exc}") from exc
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[remora] Loading preset '{args.preset}' on {device}")
     model, tokenizer = load_model_and_tokenizer(args.preset, device=device)
 
-    print("[remora] Applying Triton surgery...")
-    hijack_model(model)
+    if args.no_surgery:
+        print("[remora] Skipping Triton surgery as requested.")
+    else:
+        include = None
+        if args.surgery_include:
+            include = [tag.strip() for tag in args.surgery_include.split(",") if tag.strip()]
+        print("[remora] Applying Triton surgery..." + (f" (filter: {include})" if include else ""))
+        hijack_model(model, include=include)
 
     vibe = VibeCheckModel(
         model=model,
         tokenizer=tokenizer,
         batch_size=args.batch_size,
         flush_ms=args.flush_ms,
+        max_queue=args.max_queue,
     )
 
     datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
+    if not datasets:
+        raise SystemExit("No datasets provided; supply at least one via --datasets.")
+    print(
+        f"[remora] Queue config: batch_size={args.batch_size}, flush_ms={args.flush_ms}, max_queue={args.max_queue}"
+    )
     os.makedirs(args.output_dir, exist_ok=True)
     print(f"[remora] Launching VLMEvalKit for datasets: {datasets}")
     _run_vlmeval(vibe, datasets, args.output_dir, num_workers=args.num_workers)
