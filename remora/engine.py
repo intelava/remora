@@ -92,13 +92,32 @@ class TritonEvaluator:
         # Assume caller already passed encoded features.
         return vision
 
-    def _prepare_inputs(self, req: GenerationRequest, vision_prefix: Any) -> Dict[str, Any]:
-        text_inputs = (
-            self.tokenizer(req.prompt, return_tensors="pt", **req.tokenizer_kwargs).to(self.device)
-            if self.tokenizer is not None
-            else {"input_ids": req.prompt}
-        )
-        if vision_prefix is not None:
+    def _get_cached_vision_prefix(self, req: GenerationRequest) -> Any:
+        vkey = req.vision_key or _default_vision_key(req.vision)
+        return self.prefix_cache.get_or_set(vkey, lambda: self._encode_vision(req.vision))
+
+    def _prepare_inputs(self, req: GenerationRequest) -> Dict[str, Any]:
+        if self.tokenizer is not None and callable(self.tokenizer):
+            if req.vision is not None:
+                try:
+                    with torch.inference_mode():
+                        tokenized = self.tokenizer(
+                            req.prompt,
+                            images=req.vision,
+                            return_tensors="pt",
+                            **req.tokenizer_kwargs,
+                        )
+                    return tokenized.to(self.device)
+                except TypeError:
+                    # Tokenizer does not accept images keyword; fall back to encoded vision path below.
+                    pass
+            tokenized = self.tokenizer(req.prompt, return_tensors="pt", **req.tokenizer_kwargs)
+            return tokenized.to(self.device)
+
+        # Tokenizer unavailable; rely on caller-provided ids and optional encoded vision.
+        text_inputs: Dict[str, Any] = {"input_ids": req.prompt}
+        if req.vision is not None:
+            vision_prefix = self._get_cached_vision_prefix(req)
             if torch.is_tensor(vision_prefix):
                 vision_prefix = vision_prefix.to(self.device)
             text_inputs["vision_hidden_states"] = vision_prefix
@@ -111,9 +130,7 @@ class TritonEvaluator:
         """
         prepared_inputs: List[Dict[str, Any]] = []
         for req in requests:
-            vkey = req.vision_key or _default_vision_key(req.vision)
-            vision_prefix = self.prefix_cache.get_or_set(vkey, lambda: self._encode_vision(req.vision))
-            prepared_inputs.append(self._prepare_inputs(req, vision_prefix))
+            prepared_inputs.append(self._prepare_inputs(req))
 
         outputs: Dict[int, Dict[str, Any]] = {}
         start = time.time()
