@@ -25,6 +25,12 @@ MODEL_PRESETS: Dict[str, ModelSpec] = {
         supports_vision=True,
         description="Molmo 7B vision-language model",
     ),
+    "smolvlm-base": ModelSpec(
+        model_id="HuggingFaceTB/SmolVLM-Base",
+        tokenizer_id="HuggingFaceTB/SmolVLM-Base",
+        supports_vision=True,
+        description="SmolVLM Base vision-language model",
+    ),
     "qwen2.5-vl-7b": ModelSpec(
         model_id="Qwen/Qwen2.5-VL-7B-Instruct",
         tokenizer_id="Qwen/Qwen2.5-VL-7B-Instruct",

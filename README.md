@@ -15,6 +15,7 @@ Hyper-optimized evaluation harness for vision-language benchmarks using Triton.
       ...
   ```
 - Run a quick TPS comparison: `python run_eval.py --model-path /path/to/model`.
+- Try an interactive notebook: `notebooks/remora_quickstart.ipynb`.
 
 ## What lives where
 - `remora/kernels.py`: W8A16 Triton GEMM kernel with autotuning and CPU fallback.
@@ -25,6 +26,7 @@ Hyper-optimized evaluation harness for vision-language benchmarks using Triton.
 
 ## Preset model shortcuts
 - `molmo-7b` -> `allenai/Molmo-7B-D-0924`
+- `smolvlm-base` -> `HuggingFaceTB/SmolVLM-Base`
 - `qwen2.5-vl-7b` -> `Qwen/Qwen2.5-VL-7B-Instruct`
 
 ## VLMEvalKit
