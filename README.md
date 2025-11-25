@@ -25,9 +25,19 @@ Hyper-optimized evaluation harness for vision-language benchmarks using Triton.
 - `vibecheck.py`: Friendly facade for `import vibecheck; vibecheck.accelerate(model)`.
 
 ## Preset model shortcuts
-- `molmo-7b` -> `allenai/Molmo-7B-D-0924`
-- `smolvlm-base` -> `HuggingFaceTB/SmolVLM-Base`
-- `qwen2.5-vl-7b` -> `Qwen/Qwen2.5-VL-7B-Instruct`
+
+All models listed below support vision and can run on 16GB GPU memory:
+
+- `molmo-7b` -> `allenai/Molmo-7B-D-0924` (7B)
+- `molmo-7b-o` -> `allenai/Molmo-7B-O-0924` (7B, open weights)
+- `smolvlm-base` -> `HuggingFaceTB/SmolVLM-Base` (Base)
+- `qwen2.5-vl-7b` -> `Qwen/Qwen2.5-VL-7B-Instruct` (7B)
+- `qwen2.5-vl-3b` -> `Qwen/Qwen2.5-VL-3B-Instruct` (3B)
+- `qwen2-vl-2b` -> `Qwen/Qwen2-VL-2B-Instruct` (2B)
+- `phi-3.5-vision` -> `microsoft/Phi-3.5-vision-instruct` (4.2B)
+- `llava-1.5-7b` -> `llava-hf/llava-1.5-7b-hf` (7B)
+- `internvl2-4b` -> `OpenGVLab/InternVL2-4B` (4B)
+- `idefics2-8b` -> `HuggingFaceM4/idefics2-8b` (8B)
 
 ## VLMEvalKit
 - Run VLMEvalKit with batching + prefix caching:

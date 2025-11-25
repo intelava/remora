@@ -2,7 +2,6 @@
 TritonEvaluator coordinates batching, prefix caching, and Triton-backed generation.
 """
 
-import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -133,7 +132,6 @@ class TritonEvaluator:
             prepared_inputs.append(self._prepare_inputs(req))
 
         outputs: Dict[int, Dict[str, Any]] = {}
-        start = time.time()
         for idx, (req, inputs) in enumerate(zip(requests, prepared_inputs)):
             # Use the underlying HF generate as the high-level loop; the heavy
             # matmuls within have been swapped to TritonBitLinear via hijack_model.
@@ -149,15 +147,6 @@ class TritonEvaluator:
                 "text": text,
                 "tokens": result,
             }
-        elapsed = time.time() - start
-
-        # A basic TPS metric used by run_eval.py.
-        total_new_tokens = 0
-        for val in outputs.values():
-            tokens = val.get("tokens")
-            if torch.is_tensor(tokens):
-                total_new_tokens += int(tokens.shape[-1])
-        outputs["tps"] = total_new_tokens / max(elapsed, 1e-5)
         return outputs
 
     # Lower-level API for custom callers -----------------------------------
