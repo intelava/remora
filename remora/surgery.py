@@ -59,12 +59,17 @@ class TritonBitLinear(nn.Module):
 
     def _requantize(self):
         w_int8, scale = quantize_weight_per_channel(self.weight.detach())
-        self.weight_int8 = w_int8
-        self.weight_scale = scale
+        # Keep quantized weights on same device as original weight
+        self.weight_int8 = w_int8.to(self.weight.device)
+        self.weight_scale = scale.to(self.weight.device)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if self.weight_int8.numel() == 0:
             self._requantize()
+        # Move quantized weights to input device if needed (once)
+        if self.weight_int8.device != input.device:
+            self.weight_int8 = self.weight_int8.to(input.device)
+            self.weight_scale = self.weight_scale.to(input.device)
         return w8a16_gemm(input, self.weight_int8, self.weight_scale, self.bias)
 
     def extra_repr(self) -> str:
@@ -113,12 +118,15 @@ class TritonGELULinear(nn.Module):
 
     def _requantize(self):
         w_int8, scale = quantize_weight_per_channel(self.weight.detach())
-        self.weight_int8 = w_int8
-        self.weight_scale = scale
+        self.weight_int8 = w_int8.to(self.weight.device)
+        self.weight_scale = scale.to(self.weight.device)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if self.weight_int8.numel() == 0:
             self._requantize()
+        if self.weight_int8.device != input.device:
+            self.weight_int8 = self.weight_int8.to(input.device)
+            self.weight_scale = self.weight_scale.to(input.device)
         return w8a16_gelu_gemm(input, self.weight_int8, self.weight_scale, self.bias)
 
     def extra_repr(self) -> str:
@@ -206,12 +214,12 @@ class TritonVisionProjector(nn.Module):
         self._requantize()
 
     def _requantize(self):
-        self.weight1_int8, self.weight1_scale = quantize_weight_per_channel(
-            self.weight1.detach()
-        )
-        self.weight2_int8, self.weight2_scale = quantize_weight_per_channel(
-            self.weight2.detach()
-        )
+        w1_int8, w1_scale = quantize_weight_per_channel(self.weight1.detach())
+        w2_int8, w2_scale = quantize_weight_per_channel(self.weight2.detach())
+        self.weight1_int8 = w1_int8.to(self.weight1.device)
+        self.weight1_scale = w1_scale.to(self.weight1.device)
+        self.weight2_int8 = w2_int8.to(self.weight2.device)
+        self.weight2_scale = w2_scale.to(self.weight2.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -224,6 +232,13 @@ class TritonVisionProjector(nn.Module):
         """
         if self.weight1_int8.numel() == 0:
             self._requantize()
+
+        # Ensure weights are on the same device as input
+        if self.weight1_int8.device != x.device:
+            self.weight1_int8 = self.weight1_int8.to(x.device)
+            self.weight1_scale = self.weight1_scale.to(x.device)
+            self.weight2_int8 = self.weight2_int8.to(x.device)
+            self.weight2_scale = self.weight2_scale.to(x.device)
 
         # Flatten if needed (handle [B, N, D] input)
         orig_shape = x.shape
