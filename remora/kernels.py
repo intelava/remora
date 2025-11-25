@@ -396,14 +396,16 @@ def w8a16_gemm(
     Dequantizes weights on-the-fly in SRAM for 2x memory bandwidth savings.
 
     Args:
-        a: Activation tensor of shape [M, K] or JaggedTensor.data in fp16/bf16.
+        a: Activation tensor of shape [..., K] in fp16/bf16.
         w_int8: Quantized weights of shape [N, K] or [K, N] in int8.
         w_scale: Per-output-channel scale of shape [N].
         bias: Optional bias of shape [N].
 
     Returns:
-        Output tensor of shape [M, N] in fp16.
+        Output tensor of shape [..., N] in fp16 (same batch dims as input).
     """
+    # Save original shape to restore later
+    orig_shape = a.shape
     if a.dim() != 2:
         a = a.flatten(0, -2)
     if w_int8.dim() != 2:
@@ -453,6 +455,9 @@ def w8a16_gemm(
             w_scale.stride(0),
             bias is not None,
         )
+        # Restore original batch dimensions
+        if len(orig_shape) > 2:
+            c = c.view(*orig_shape[:-1], N)
         return c
 
     # Fallback: dequantize and use a standard matmul for CPU/dev environments.
@@ -460,6 +465,9 @@ def w8a16_gemm(
     out = a @ dequant_w
     if bias is not None:
         out += bias
+    # Restore original batch dimensions
+    if len(orig_shape) > 2:
+        out = out.view(*orig_shape[:-1], N)
     return out
 
 
@@ -477,14 +485,16 @@ def w8a16_gelu_gemm(
     otherwise require writing to and reading from global memory.
 
     Args:
-        a: Activation tensor of shape [M, K] in fp16/bf16.
+        a: Activation tensor of shape [..., K] in fp16/bf16.
         w_int8: Quantized weights of shape [N, K] or [K, N] in int8.
         w_scale: Per-output-channel scale of shape [N].
         bias: Optional bias of shape [N].
 
     Returns:
-        Output tensor of shape [M, N] with GELU applied, in fp16.
+        Output tensor of shape [..., N] with GELU applied, in fp16.
     """
+    # Save original shape to restore later
+    orig_shape = a.shape
     if a.dim() != 2:
         a = a.flatten(0, -2)
     if w_int8.dim() != 2:
@@ -534,6 +544,9 @@ def w8a16_gelu_gemm(
             w_scale.stride(0),
             bias is not None,
         )
+        # Restore original batch dimensions
+        if len(orig_shape) > 2:
+            c = c.view(*orig_shape[:-1], N)
         return c
 
     # Fallback: dequantize and use standard ops for CPU/dev environments.
@@ -543,7 +556,11 @@ def w8a16_gelu_gemm(
     out = a @ dequant_w
     if bias is not None:
         out = out + bias
-    return F.gelu(out, approximate="tanh")
+    out = F.gelu(out, approximate="tanh")
+    # Restore original batch dimensions
+    if len(orig_shape) > 2:
+        out = out.view(*orig_shape[:-1], N)
+    return out
 
 
 def jagged_w8a16_gemm(
