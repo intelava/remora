@@ -1,5 +1,6 @@
 """
-Simple benchmark harness that contrasts stock PyTorch vs. VibeCheck/Triton.
+Simple benchmark harness that contrasts stock PyTorch vs. your ragged/W8A16 path.
+Fill in the TODOs inside remora before running this.
 
 Usage:
 python run_eval.py --model-path /path/to/model --prompt "Describe the image" --image /path/to/image.png
@@ -17,13 +18,12 @@ except ImportError:  # pragma: no cover - optional
 import torch
 
 try:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForVision2Seq
 except Exception as exc:  # pragma: no cover - optional dependency
     raise SystemExit("transformers required to run the benchmark") from exc
 
 from remora.integration import VibeCheckModel
 from remora.models import MODEL_PRESETS, load_model_and_tokenizer
-from remora.surgery import hijack_model
 
 
 def _token_length(tokenizer, text: str) -> int:
@@ -73,7 +73,7 @@ def run(args: argparse.Namespace):
         model, tokenizer = load_model_and_tokenizer(args.preset, device=device)
     else:
         print(f"Loading model from {args.model_path} on {device}")
-        model = AutoModelForCausalLM.from_pretrained(args.model_path, trust_remote_code=True).to(device)
+        model = AutoModelForVision2Seq.from_pretrained(args.model_path, trust_remote_code=True).to(device)#change it to a modular Auto
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     image = _load_image(args.image_path)
 
@@ -89,8 +89,7 @@ def run(args: argparse.Namespace):
     stock_tps = measure_tps(tokenizer, stock_generate, args.prompt, image=image)
     print(f"Stock TPS: {stock_tps:.2f}")
 
-    print("Applying Triton surgery and evaluating VibeCheck...")
-    hijack_model(model)
+    print("Evaluating the VibeCheck path (requires your ragged/W8A16 implementation)...")
     vibe = VibeCheckModel(model=model, tokenizer=tokenizer, batch_size=args.batch_size)
 
     def vibe_generate(prompt, image=None):

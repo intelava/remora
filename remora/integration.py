@@ -1,8 +1,9 @@
 """
-VLMEvalKit integration. We use an internal queue to coalesce sequential calls from
-the evaluator into GPU-friendly batches.
+VLMEvalKit integration. We use an internal queue to coalesce sequential calls
+into batches that your ragged/W8A16 pipeline can consume.
 """
 
+import logging
 import threading
 import time
 from collections import deque
@@ -16,7 +17,9 @@ except Exception:  # pragma: no cover - optional dependency
     class CustomLLM:  # type: ignore
         pass
 
-from .engine import GenerationRequest, TritonEvaluator
+from .engine import GenerationRequest, RemoraEngine
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -33,8 +36,8 @@ class _QueuedRequest:
 class VibeCheckModel(CustomLLM):
     """
     Drop-in wrapper for VLMEvalKit. Calls are buffered and flushed into batches
-    so Triton kernels see meaningful batch sizes even when the upstream loop is
-    strictly sequential.
+    so your ragged batching path sees meaningful batch sizes even when the
+    upstream loop is strictly sequential.
     """
 
     def __init__(
@@ -44,10 +47,10 @@ class VibeCheckModel(CustomLLM):
         batch_size: int = 4,
         flush_ms: float = 10.0,
         max_queue: int = 64,
-        evaluator: Optional[TritonEvaluator] = None,
+        evaluator: Optional[RemoraEngine] = None,
     ):
         super().__init__()
-        self.engine = evaluator or TritonEvaluator(model=model, tokenizer=tokenizer)
+        self.engine = evaluator or RemoraEngine(model=model, tokenizer=tokenizer)
         self.batch_size = batch_size
         self.flush_ms = flush_ms
         self.max_queue = max_queue
@@ -148,8 +151,16 @@ class VibeCheckModel(CustomLLM):
                     continue
                 out = results.get(i)
                 if out is None:
-                    req.future.set_exception(RuntimeError(f"Missing generation output for batch index {i}."))
+                    error_msg = f"Missing generation output for batch index {i}."
+                    logger.error(error_msg)
+                    req.future.set_exception(RuntimeError(error_msg))
                     continue
+                
+                if "error" in out:
+                    logger.error(f"Generation error for request {i}: {out['error']}")
+                    req.future.set_exception(RuntimeError(out["error"]))
+                    continue
+
                 req.future.set_result(out.get("text", ""))
 
     def close(self, cancel_pending: bool = False, timeout: float = 0.5):

@@ -1,28 +1,28 @@
 # remora
 
-Hyper-optimized evaluation harness for vision-language benchmarks using Triton.
+Scaffold for ragged batching + W8A16 quantization. Prior accelerator-specific
+code has been removed; the TODOs are yours to fill.
+
+## Where to write code
+- `remora/engine.py`: build ragged batches, run your model with W8A16, decode outputs.
+- `remora/kernels.py`: JaggedTensor helpers and the W8A16 kernels/quantizers to implement.
+- `remora/surgery.py`: optional model surgery hooks if you want to swap modules.
+- `remora/integration.py`: VLMEvalKit adapter that calls `RemoraEngine.generate_batch`.
+- `vibecheck.py`: Friendly facade for `import vibecheck; vibecheck.accelerate(model)`.
 
 ## Usage
-- Swap linear layers to Triton and obtain an evaluator:
+- Instantiate the engine (after filling in the TODOs):
   ```python
   import vibecheck
-  evaluator = vibecheck.accelerate(model, tokenizer)
+  engine = vibecheck.accelerate(model, tokenizer)
   ```
 - Wrap for VLMEvalKit:
   ```python
   from remora.integration import VibeCheckModel
-  with VibeCheckModel(model, tokenizer) as vibe:
+  with VibeCheckModel(model, tokenizer, evaluator=engine) as vibe:
       ...
   ```
-- Run a quick TPS comparison: `python run_eval.py --model-path /path/to/model`.
-- Try an interactive notebook: `notebooks/remora_quickstart.ipynb`.
-
-## What lives where
-- `remora/kernels.py`: W8A16 Triton GEMM kernel with autotuning and CPU fallback.
-- `remora/surgery.py`: Model hijacker that swaps nn.Linear for TritonBitLinear.
-- `remora/engine.py`: Prefix caching and batch-aware generation orchestrator.
-- `remora/integration.py`: VLMEvalKit adapter with batching queue to force GPU utilization.
-- `vibecheck.py`: Friendly facade for `import vibecheck; vibecheck.accelerate(model)`.
+- Run a quick eval once your kernels are in place: `python run_eval.py --model-path /path/to/model`.
 
 ## Preset model shortcuts
 
@@ -40,15 +40,13 @@ All models listed below support vision and can run on 16GB GPU memory:
 - `idefics2-8b` -> `HuggingFaceM4/idefics2-8b` (8B)
 
 ## VLMEvalKit
-- Run VLMEvalKit with batching + prefix caching:
+- Run VLMEvalKit with batching + prefix caching (after filling in the engine/kernels):
   ```
   python vlmeval_bench.py --preset molmo-7b --datasets MME,TextVQA --batch-size 4
   ```
   Adjust `--datasets` to any VLMEvalKit dataset name (e.g., GQA, MMVet, MathVista).
 - Discover presets without editing code: `python vlmeval_bench.py --list-presets`.
-- Override hardware or avoid surgery: `python vlmeval_bench.py --device cpu --no-surgery`.
 - Tune batching from the CLI: `--batch-size`, `--flush-ms`, and `--max-queue` control how aggressively requests are coalesced.
-- Narrow surgery targets if needed: `--surgery-include decoder.layers.0,attention`.
 
 ## Install as a package
 - Editable dev install:

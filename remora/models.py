@@ -2,6 +2,7 @@
 Preset model loader utilities.
 """
 
+import logging
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple
 
@@ -12,6 +13,8 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -87,24 +90,44 @@ def load_model_and_tokenizer(
     Loads a preset model + tokenizer pair for convenience.
     """
     if preset not in MODEL_PRESETS:
-        raise ValueError(f"Unknown preset '{preset}'. Available: {', '.join(MODEL_PRESETS.keys())}")
+        error_msg = f"Unknown preset '{preset}'. Available: {', '.join(MODEL_PRESETS.keys())}"
+        logger.error(error_msg)
+        raise ValueError(error_msg)
     spec = MODEL_PRESETS[preset]
+    logger.info(f"Loading preset '{preset}': {spec.description}")
+
     model_fn = spec.model_loader or AutoModelForCausalLM.from_pretrained
-    model = model_fn(
-        spec.model_id,
-        trust_remote_code=spec.trust_remote_code,
-    )
+    try:
+        model = model_fn(
+            spec.model_id,
+            trust_remote_code=spec.trust_remote_code,
+        )
+    except Exception as e:
+        logger.error(f"Failed to load model '{spec.model_id}': {e}")
+        raise
+
+    tokenizer = None
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             spec.tokenizer_id or spec.model_id,
             trust_remote_code=spec.trust_remote_code,
         )
-    except Exception:
-        tokenizer = AutoProcessor.from_pretrained(
-            spec.tokenizer_id or spec.model_id,
-            trust_remote_code=spec.trust_remote_code,
-        )
+    except Exception as e:
+        logger.info(f"AutoTokenizer failed for '{spec.tokenizer_id or spec.model_id}', trying AutoProcessor. Error: {e}")
+        try:
+            tokenizer = AutoProcessor.from_pretrained(
+                spec.tokenizer_id or spec.model_id,
+                trust_remote_code=spec.trust_remote_code,
+            )
+        except Exception as e2:
+            logger.error(f"Both AutoTokenizer and AutoProcessor failed for '{spec.tokenizer_id or spec.model_id}'. Last error: {e2}")
+            # We don't raise here immediately, as some workflows might work without tokenizer? 
+            # But usually it's fatal. Let's raise.
+            raise RuntimeError(f"Could not load tokenizer or processor for {preset}") from e2
+
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    logger.info(f"Moving model to {device}")
     model = model.to(device)
     return model, tokenizer

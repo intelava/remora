@@ -1,14 +1,20 @@
 """
-TritonEvaluator coordinates batching, prefix caching, and Triton-backed generation.
+Ragged batching + W8A16 quantization scaffold.
+
+Fill in the TODO sections with your own logic for:
+- Building ragged batches from text/vision requests
+- Running the model with your W8A16 quantization path
+- Decoding model outputs back to text
 """
 
+import logging
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
-from .kernels import w8a16_gemm
+logger = logging.getLogger(__name__)
 
 
 def _default_vision_key(image: Any) -> Any:
@@ -19,6 +25,10 @@ def _default_vision_key(image: Any) -> Any:
 
 
 class PrefixCache:
+    """
+    Simple LRU-ish cache for encoded vision prefixes.
+    """
+
     def __init__(self, capacity: int = 8):
         self.capacity = capacity
         self._store: OrderedDict[Any, Any] = OrderedDict()
@@ -41,16 +51,18 @@ class PrefixCache:
 class GenerationRequest:
     prompt: str
     vision: Any = None
+    attention_mask: Any = None
     tokenizer_kwargs: Dict[str, Any] = field(default_factory=dict)
     generate_kwargs: Dict[str, Any] = field(default_factory=dict)
     vision_key: Any = None
 
 
-class TritonEvaluator:
+class RemoraEngine:
     """
-    Thin orchestrator that sits between VLMEvalKit and the model. It batches text,
-    reuses vision prefixes, and leans on Triton-backed linear layers installed via
-    hijack_model.
+    Coordinator for ragged batching + W8A16 quantization hooks.
+
+    Nothing below enforces a specific implementation; wire up the TODOs with
+    your own batching path and quantized matmuls.
     """
 
     def __init__(
@@ -67,88 +79,78 @@ class TritonEvaluator:
                 device = model.device
             else:
                 try:
-                    device = next(model.parameters()).device
+                    device = next(model.parameters()).device  # type: ignore[attr-defined]
                 except Exception:
                     device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
         self.prefix_cache = PrefixCache(max_prefix_cache)
-        self.model.to(self.device)
+        try:
+            self.model.to(self.device)
+        except Exception:
+            logger.debug("Model does not support .to(device); skipping move.")
         if tokenizer is not None and hasattr(tokenizer, "padding_side"):
             tokenizer.padding_side = "left"
 
     # Vision encoding hooks -------------------------------------------------
-    def _encode_vision(self, vision: Any) -> Any:
-        if vision is None:
-            return None
+    def encode_vision(self, vision: Any) -> Any:
 
-        if hasattr(self.model, "get_vision_tower"):
-            vt = self.model.get_vision_tower()
-            prefix = vt(vision)
-            return prefix.to(self.device) if torch.is_tensor(prefix) else prefix
-        if hasattr(self.model, "vision_encoder"):
-            prefix = self.model.vision_encoder(vision)
-            return prefix.to(self.device) if torch.is_tensor(prefix) else prefix
-        # Assume caller already passed encoded features.
-        return vision
+        vision_embeds = self.model.get_vision_embeds(vision)
+        return vision_embeds
 
-    def _get_cached_vision_prefix(self, req: GenerationRequest) -> Any:
+    def get_cached_vision_prefix(self, req: GenerationRequest) -> Any:
         vkey = req.vision_key or _default_vision_key(req.vision)
-        return self.prefix_cache.get_or_set(vkey, lambda: self._encode_vision(req.vision))
-
-    def _prepare_inputs(self, req: GenerationRequest) -> Dict[str, Any]:
-        if self.tokenizer is not None and callable(self.tokenizer):
-            if req.vision is not None:
-                try:
-                    with torch.inference_mode():
-                        tokenized = self.tokenizer(
-                            req.prompt,
-                            images=req.vision,
-                            return_tensors="pt",
-                            **req.tokenizer_kwargs,
-                        )
-                    return tokenized.to(self.device)
-                except TypeError:
-                    # Tokenizer does not accept images keyword; fall back to encoded vision path below.
-                    pass
-            tokenized = self.tokenizer(req.prompt, return_tensors="pt", **req.tokenizer_kwargs)
-            return tokenized.to(self.device)
-
-        # Tokenizer unavailable; rely on caller-provided ids and optional encoded vision.
-        text_inputs: Dict[str, Any] = {"input_ids": req.prompt}
-        if req.vision is not None:
-            vision_prefix = self._get_cached_vision_prefix(req)
-            if torch.is_tensor(vision_prefix):
-                vision_prefix = vision_prefix.to(self.device)
-            text_inputs["vision_hidden_states"] = vision_prefix
-        return text_inputs
+        return self.prefix_cache.get_or_set(vkey, lambda: self.encode_vision(req.vision))
 
     # Core batching path ----------------------------------------------------
-    def generate_batch(self, requests: List[GenerationRequest]) -> Dict[int, Dict[str, Any]]:
+    def build_ragged_batch(self, requests: List[GenerationRequest]) -> Dict[str, Any]:
         """
-        Executes a batch of requests. Returns a map of index -> dict with text + metadata.
+        TODO: convert the incoming requests into your ragged batch format.
+        Make sure to surface both token ids and attention masks (plus any
+        vision prefixes) in the returned dict for the model forward.
         """
-        prepared_inputs: List[Dict[str, Any]] = []
-        for req in requests:
-            prepared_inputs.append(self._prepare_inputs(req))
+        attention_masks = [req.attention_mask for req in requests]
+        vision_prefixes = [self.get_cached_vision_prefix(req) for req in requests]
+        token_ids = [self.tokenizer.encode(req.prompt) for req in requests]
+        
+        blocked_attention_mask = torch.block_diag(*attention_masks)
+        vision_prefixes = torch.cat(vision_prefixes, dim=0)
+        token_ids = torch.cat(token_ids, dim=0)
 
-        outputs: Dict[int, Dict[str, Any]] = {}
-        for idx, (req, inputs) in enumerate(zip(requests, prepared_inputs)):
-            # Use the underlying HF generate as the high-level loop; the heavy
-            # matmuls within have been swapped to TritonBitLinear via hijack_model.
-            generate_kwargs = {"max_new_tokens": 64, "use_cache": True}
-            generate_kwargs.update(req.generate_kwargs)
-            with torch.inference_mode():
-                result = self.model.generate(**inputs, **generate_kwargs)
-            if self.tokenizer is not None and hasattr(self.tokenizer, "decode"):
-                text = self.tokenizer.decode(result[0], skip_special_tokens=True)
-            else:
-                text = result
-            outputs[idx] = {
-                "text": text,
-                "tokens": result,
-            }
+        return {
+            "attention_mask": blocked_attention_mask,
+            "vision_prefixes": vision_prefixes,
+            "token_ids": token_ids,
+        }
+
+    def run_model(self, batch_inputs: Dict[str, Any]) -> Any:
+        """
+        TODO: call the underlying model using your W8A16 quantized path.
+        Plug in your custom linear layers or kernels inside this function.
+        """
+
+
+        hidden_states = self.model.forward(
+            attention_mask=batch_inputs["attention_mask"],
+            vision_prefixes=batch_inputs["vision_prefixes"],
+            token_ids=batch_inputs["token_ids"],
+        )
+        return hidden_states
+
+    def decode_outputs(
+        self, model_outputs: Any, requests: List[GenerationRequest], tokenizer: Any
+    ) -> Dict[int, Dict[str, Any]]:
+        """
+        TODO: map raw model outputs back to strings/tokens per request.
+        """
+        outputs = tokenizer.decode(model_outputs, skip_special_tokens=True)
         return outputs
 
-    # Lower-level API for custom callers -----------------------------------
-    def triton_linear(self, a: torch.Tensor, w_int8: torch.Tensor, scale: torch.Tensor, bias=None) -> torch.Tensor:
-        return w8a16_gemm(a, w_int8, scale, bias)
+    def generate_batch(self, requests: List[GenerationRequest]) -> Dict[int, Dict[str, Any]]:
+        """
+        Entry point used by integrations. This method wires together the three
+        extensibility points: ragged batching, W8A16 model execution, and decoding.
+        """
+        logger.debug("generate_batch called with %d requests", len(requests))
+        batch_inputs = self.build_ragged_batch(requests)
+        raw_outputs = self.run_model(batch_inputs)
+        return self.decode_outputs(raw_outputs, requests)

@@ -1,50 +1,42 @@
 """
 Lightweight facade so users can `import vibecheck; vibecheck.accelerate(model)`.
-
-For full functionality, use `import remora` directly.
+Everything is scaffolded for ragged batching + W8A16 quantization, with TODOs
+left for you to fill in.
 """
 
 from remora import (
     MODEL_PRESETS,
+    GenerationRequest,
     JaggedTensor,
-    TritonEvaluator,
-    TritonVisionProjector,
+    RemoraEngine,
     VibeCheckModel,
-    full_vlm_surgery,
-    hijack_model,
-    hijack_vision_projector,
+    accelerate,
+    jagged_w8a16_gelu_gemm,
+    jagged_w8a16_gemm,
     load_model_and_tokenizer,
     pack_sequences,
+    pad_jagged,
+    quantize_weight_per_channel,
+    unpack_sequences,
+    w8a16_gelu_gemm,
+    w8a16_gemm,
 )
-
-
-def accelerate(model, tokenizer=None, full_vlm: bool = False, **kwargs):
-    """
-    Applies Triton surgery and returns a TritonEvaluator instance.
-
-    Args:
-        model: PyTorch model to accelerate
-        tokenizer: Optional tokenizer
-        full_vlm: If True, also replaces vision projector with fused version
-    """
-    verbose = kwargs.pop("verbose", True)
-    if full_vlm:
-        full_vlm_surgery(model, verbose=verbose)
-    else:
-        hijack_model(model, verbose=verbose)
-    return TritonEvaluator(model=model, tokenizer=tokenizer, **kwargs)
 
 
 __all__ = [
     "accelerate",
-    "TritonEvaluator",
+    "RemoraEngine",
     "VibeCheckModel",
-    "TritonVisionProjector",
-    "hijack_model",
-    "hijack_vision_projector",
-    "full_vlm_surgery",
+    "GenerationRequest",
     "JaggedTensor",
     "pack_sequences",
+    "unpack_sequences",
+    "pad_jagged",
+    "w8a16_gemm",
+    "w8a16_gelu_gemm",
+    "jagged_w8a16_gemm",
+    "jagged_w8a16_gelu_gemm",
+    "quantize_weight_per_channel",
     "MODEL_PRESETS",
     "load_model_and_tokenizer",
 ]

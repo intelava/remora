@@ -1,6 +1,8 @@
 """
-VLMEvalKit bridging script. Loads a preset model, applies Triton surgery, wraps it
-with VibeCheckModel, and calls VLMEvalKit on chosen datasets (e.g., MME, TextVQA).
+VLMEvalKit bridging script. Loads a preset model, wraps it with VibeCheckModel,
+and calls VLMEvalKit on chosen datasets (e.g., MME, TextVQA).
+
+Fill in the TODOs inside remora before running this so the ragged/W8A16 path is functional.
 
 Example:
 python vlmeval_bench.py --preset molmo-7b --datasets MME,TextVQA --batch-size 4
@@ -16,7 +18,6 @@ import torch
 
 from remora.integration import VibeCheckModel
 from remora.models import MODEL_PRESETS, load_model_and_tokenizer
-from remora.surgery import hijack_model
 
 
 def _run_vlmeval(vibe_model: VibeCheckModel, datasets: List[str], output_dir: str, **kwargs):
@@ -90,16 +91,6 @@ def parse_args() -> argparse.Namespace:
         type=str,
         help="Device override (e.g., cpu, cuda, cuda:0). Defaults to CUDA if available.",
     )
-    parser.add_argument(
-        "--no-surgery",
-        action="store_true",
-        help="Skip Triton surgery (keep stock nn.Linear layers).",
-    )
-    parser.add_argument(
-        "--surgery-include",
-        type=str,
-        help="Comma-separated substrings limiting which Linear layers are swapped.",
-    )
     parser.add_argument("--output-dir", type=str, default="outputs", help="Result directory for VLMEvalKit.")
     parser.add_argument("--num-workers", type=int, default=1, help="VLMEvalKit worker threads.")
     return parser.parse_args()
@@ -121,15 +112,6 @@ def main():
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[remora] Loading preset '{args.preset}' on {device}")
     model, tokenizer = load_model_and_tokenizer(args.preset, device=device)
-
-    if args.no_surgery:
-        print("[remora] Skipping Triton surgery as requested.")
-    else:
-        include = None
-        if args.surgery_include:
-            include = [tag.strip() for tag in args.surgery_include.split(",") if tag.strip()]
-        print("[remora] Applying Triton surgery..." + (f" (filter: {include})" if include else ""))
-        hijack_model(model, include=include)
 
     vibe = VibeCheckModel(
         model=model,
