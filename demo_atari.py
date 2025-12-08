@@ -5,46 +5,61 @@ import time
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from PIL import Image
 
+# --- Import Remora Optimizer ---
+# This will allow us to patch the model for acceleration
+from remora.optimizer import optimize_model
+
 def get_moondream_model():
     """Loads the Moondream2 model and tokenizer from Hugging Face."""
-    # Using a revision to ensure reproducibility, as the main branch can change.
     model_id = "vikhyatk/moondream2"
     revision = "2024-05-20"
     
+    print(f"Loading base model '{model_id}'...")
     model = AutoModelForCausalLM.from_pretrained(
         model_id, trust_remote_code=True, revision=revision,
-        torch_dtype=torch.float16, device_map={"": "cuda"}
+        torch_dtype=torch.float16, device_map={" ": "cuda"}
     )
     tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
+    print("Base model loaded.")
     return model, tokenizer
 
 def map_action_to_pong(action_text: str) -> int:
     """Converts the VLM's text output to a valid Pong action."""
     action_text = action_text.upper()
     if "UP" in action_text:
-        return 2  # UP
+        return 2
     elif "DOWN" in action_text:
-        return 3  # DOWN
-    return 0  # NOOP
+        return 3
+    return 0
 
 def run_pong_with_vlm():
     """
-    Runs a live demo in the Pong environment, controlled by the Moondream2 VLM.
+    Runs a live demo in the Pong environment, controlled by a VLM
+    that has been accelerated by the Remora engine.
     """
-    print("--- VLM-driven Gameplay: Moondream2 plays Pong ---")
+    print("--- Remora-Accelerated VLM Gameplay: Moondream2 + Remora plays Pong ---")
     
     # --- Configuration ---
-    TARGET_HZ = 30
-    TARGET_LATENCY_MS = 1000 / TARGET_HZ
-    # This prompt is crucial for guiding the VLM's decision-making.
+    TARGET_LATENCY_MS = 1000 / 30  # ~33.3ms for 30Hz
     PROMPT = "You are an expert Atari player. The image is a frame from the game Pong. Your paddle is on the right. Should you move your paddle UP or DOWN to intercept the ball? Answer with only the word UP or DOWN."
 
     # --- Initialization ---
     try:
-        print("Loading Moondream2 model...")
         model, tokenizer = get_moondream_model()
         
-        print("Initializing Gymnasium environment...")
+        # --- Apply Remora Optimization ---
+        print("\n--- Applying Remora Optimization ---")
+        print("Model structure before optimization:")
+        print(model)
+        
+        # Patch the nn.Linear layers with Remora's W8A16Linear layers
+        # We skip the final lm_head to maintain full precision for logits, a common practice.
+        optimize_model(model, layers_to_skip=['lm_head'])
+        
+        print("\nModel structure after optimization:")
+        print(model)
+        print("--- Remora Optimization Complete ---\n")
+        
         env = gym.make("PongNoFrameskip-v4", render_mode='human')
         observation, info = env.reset(seed=42)
         
@@ -52,48 +67,33 @@ def run_pong_with_vlm():
         print(f"\n--- DEPENDENCY ERROR ---\nError: {e}\nPlease install dependencies: pip install -r requirements.txt")
         return
     except Exception as e:
-        print(f"\n--- FATAL ERROR ---\nFailed to initialize model or environment: {e}\nThis demo requires a CUDA GPU and all dependencies from requirements.txt.")
+        print(f"\n--- FATAL ERROR ---\n{e}\nThis demo requires a Linux environment with a CUDA GPU and all dependencies from requirements.txt.")
         return
 
-    print(f"\nStarting game loop (target < {TARGET_LATENCY_MS:.2f}ms)... Press Ctrl+C to stop.")
-    
+    print(f"Starting game loop (target < {TARGET_LATENCY_MS:.2f}ms)... Press Ctrl+C to stop.")
     latencies = []
-    running = True
     frame_count = 0
     
     try:
-        while running:
+        while True:
             frame_count += 1
-            
-            # --- VLM Inference Step ---
             start_time = time.perf_counter()
             
-            # Convert frame to PIL Image for the model's processor
             pil_image = Image.fromarray(observation)
-            
-            # Get the model's answer
             enc_image = model.encode_image(pil_image)
-            model_answer = model.answer_question(
-                enc_image,
-                PROMPT,
-                tokenizer,
-                chat_history="" # Ensure each frame is an independent decision
-            )
+            model_answer = model.answer_question(enc_image, PROMPT, tokenizer, chat_history="")
             
-            torch.cuda.synchronize() # Ensure accurate timing
+            torch.cuda.synchronize()
             latency_ms = (time.perf_counter() - start_time) * 1000
-            latencies.append(latency_ms)
+            if frame_count > 1: latencies.append(latency_ms) # Exclude first run
             
-            # --- Environment Step ---
             pong_action = map_action_to_pong(model_answer)
-            observation, reward, terminated, truncated, info = env.step(pong_action)
+            observation, _, terminated, truncated, _ = env.step(pong_action)
             
-            # --- Display results ---
             status = "PASS" if latency_ms <= TARGET_LATENCY_MS else "FAIL"
             print(f"Frame {frame_count:04d}: Action='{model_answer.strip()}', Latency={latency_ms:6.2f}ms [{status}]")
 
             if terminated or truncated:
-                print("Game over. Resetting environment.")
                 observation, info = env.reset()
 
     except KeyboardInterrupt:
@@ -101,20 +101,21 @@ def run_pong_with_vlm():
     except Exception as e:
         print(f"\nAn error occurred during the game loop: {e}")
         
-finally:
+    finally:
         env.close()
         if latencies:
-            latencies_arr = np.array(latencies[1:]) # Exclude first run from stats (warm-up)
-            if latencies_arr.size > 0:
-                avg_latency = np.mean(latencies_arr)
-                p95_latency = np.percentile(latencies_arr, 95)
-                pass_rate = np.sum(latencies_arr <= TARGET_LATENCY_MS) / len(latencies_arr) * 100
-
-                print("\n--- Performance Summary ---")
-                print(f"Target Latency: {TARGET_LATENCY_MS:.2f}ms (~{TARGET_HZ}Hz)")
-                print(f"Average Latency (post-warmup): {avg_latency:.2f}ms")
-                print(f"P95 Latency:   {p95_latency:.2f}ms")
-                print(f"Pass Rate (<= {TARGET_LATENCY_MS:.2f}ms): {pass_rate:.2f}%")
+            latencies_arr = np.array(latencies)
+            avg_latency = np.mean(latencies_arr)
+            p95_latency = np.percentile(latencies_arr, 95)
+            
+            print("\n--- Performance Summary (Remora-Accelerated) ---")
+            print(f"Average Latency (post-warmup): {avg_latency:.2f}ms")
+            print(f"P95 Latency:   {p95_latency:.2f}ms")
+            
+            if avg_latency <= TARGET_LATENCY_MS:
+                print("\nConclusion: The Remora-accelerated model met the real-time performance target!")
+            else:
+                print("\nConclusion: The model did not meet the performance target.")
 
 if __name__ == "__main__":
     run_pong_with_vlm()

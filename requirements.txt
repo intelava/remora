@@ -1,6 +1,10 @@
 # Required for core tensor operations and GPU acceleration
 torch
 
+# Required for custom high-performance GPU kernels
+# This requires a Linux environment with an NVIDIA GPU.
+triton
+
 # Used in the demo for performance metric calculations
 numpy
 
