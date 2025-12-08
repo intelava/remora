@@ -1,0 +1,14 @@
+# Required for core tensor operations and GPU acceleration
+torch
+
+# Required for custom high-performance GPU kernels
+# Please install the version compatible with your CUDA toolkit
+triton
+
+# Used in the demo for performance metric calculations
+numpy
+
+# Required for the Atari environment and image preprocessing
+gymnasium[atari]
+ale-py
+opencv-python-headless
