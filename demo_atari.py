@@ -1,5 +1,5 @@
 import torch
-import gymnasium as gym
+import gym
 import numpy as np
 import time
 
@@ -52,7 +52,7 @@ def run_pong_demo():
         engine = RemoraEngine(image_size=(84, 84), hidden_dim=2048, num_layers=4, num_actions=2)
         
         # Initialize the Gymnasium environment
-        env = gym.make("PongNoFrameskip-v4", render_mode='human')
+        env = gym.make("PongDeterministic-v4", render_mode='human')
         observation, info = env.reset(seed=42)
         
     except ImportError as e:
