@@ -6,7 +6,7 @@ torch
 triton
 
 # Used in the demo for performance metric calculations
-numpy
+numpy==1.23.5
 
 # Required for the Atari environment
 gymnasium[atari]

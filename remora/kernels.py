@@ -1,106 +1,71 @@
 import torch
 import triton
 import triton.language as tl
+import torch.nn as nn
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'num_stages': 3, 'num_warps': 8}),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'num_stages': 3, 'num_warps': 8}),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'num_stages': 4, 'num_warps': 4}),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'num_stages': 4, 'num_warps': 4}),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8, 'num_stages': 2, 'num_warps': 4}),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8, 'num_stages': 3, 'num_warps': 4}),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8, 'num_stages': 3, 'num_warps': 4}),
-        # Additional configs for H100 might benefit from larger block sizes
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8, 'num_stages': 3, 'num_warps': 8}),
-    ],
-    key=['M', 'N', 'K'],
-)
 @triton.jit
-def w8a16_matmul_kernel(
-    a_ptr, b_ptr, c_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
+def _rmsnorm_kernel(X_ptr, W_ptr, Out_ptr, stride_x_row, stride_x_col, stride_w_row, stride_w_col, stride_out_row, stride_out_col, N_COLS, eps, BLOCK_SIZE: tl.constexpr):
+    row_idx = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N_COLS
+    x = tl.load(X_ptr + row_idx * stride_x_row + cols * stride_x_col, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(W_ptr + cols * stride_w_col, mask=mask, other=0.0).to(tl.float32)
+    rstd = tl.rsqrt((tl.sum(x * x, axis=0) / N_COLS) + eps)
+    tl.store(Out_ptr + row_idx * stride_out_row + cols * stride_out_col, x * rstd * w, mask=mask)
+
+
+@triton.jit
+def _rope_kernel(
+    Q_ptr, Cos_ptr, Sin_ptr,
+    stride_q_row, stride_q_col,
+    stride_cos_row, stride_cos_col,
+    seq_len, head_dim: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
 ):
-    """
-    Kernel for W8A16 (int8 weight, fp16 activation) matrix multiplication.
-    C = A @ B.T, where B is int8 and A is fp16.
+    pid = tl.program_id(0)
+    row_idx = pid 
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < head_dim
+    q_ptr = Q_ptr + row_idx * stride_q_row
+    q = tl.load(q_ptr + offsets * stride_q_col, mask=mask, other=0.0)
+    cos = tl.load(Cos_ptr + offsets * stride_cos_col, mask=mask, other=1.0)
+    sin = tl.load(Sin_ptr + offsets * stride_cos_col, mask=mask, other=0.0)
+    half_dim = head_dim // 2
+    swap_offsets = (offsets + half_dim) % head_dim
+    q_swapped = tl.load(q_ptr + swap_offsets * stride_q_col, mask=mask, other=0.0)
+    sign = tl.where(offsets < half_dim, -1.0, 1.0)
+    q_out = (q * cos) + (q_swapped * sin * sign)
+    tl.store(q_ptr + offsets * stride_q_col, q_out, mask=mask)
 
-    This kernel is optimized for modern GPUs (e.g., Ampere, Hopper) by:
-    1. Using vectorized loads to read int8 weights.
-    2. Casting the entire block of weights to fp16 at once.
-    3. Using tl.dot() to leverage Tensor Cores for the matrix multiplication.
-    4. Using grouped ordering to improve L2 cache reuse.
-    """
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+@triton.jit
+def _binary_classifier_kernel(
+    X_ptr, W_ptr, Out_ptr,
+    stride_x_row, stride_x_col,
+    stride_w_row, stride_w_col,
+    idx_up, idx_down,
+    K: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    row_start_ptr = X_ptr + pid * stride_x_row
+    k_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = k_offsets < K
+    x = tl.load(row_start_ptr + k_offsets * stride_x_col, mask=mask, other=0.0)
+    w_up = tl.load(W_ptr + idx_up * stride_w_row + k_offsets * stride_w_col, mask=mask, other=0.0)
+    w_down = tl.load(W_ptr + idx_down * stride_w_row + k_offsets * stride_w_col, mask=mask, other=0.0)
+    logit_up = tl.sum(x * w_up)
+    logit_down = tl.sum(x * w_down)
+    result = tl.where(logit_up > logit_down, idx_up, idx_down)
+    tl.store(Out_ptr + pid, result)
 
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
-
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-
-    for k in range(0, K, BLOCK_SIZE_K):
-        offs_k = k + tl.arange(0, BLOCK_SIZE_K)
-        a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
-        b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
-
-        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
-        b_mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)
-        
-        # Load int8 weights and cast to fp16
-        b_int8 = tl.load(b_ptrs, mask=b_mask, other=0)
-        b = b_int8.to(tl.float16)
-        
-        # Load fp16 activations
-        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        
-        # Perform matrix multiplication
-        accumulator += tl.dot(a, b)
-
-    c = accumulator.to(tl.float16)
-    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
-
-def w8a16_matmul(a: torch.Tensor, b_quant: torch.Tensor, b_scale: torch.Tensor) -> torch.Tensor:
-    """
-    Launcher for the w8a16_matmul kernel.
-
-    Args:
-        a (torch.Tensor): The fp16 activation tensor of shape (M, K).
-        b_quant (torch.Tensor): The int8 quantized weight tensor of shape (N, K).
-        b_scale (torch.Tensor): The fp16 scale tensor of shape (N, 1).
-    """
-    M, K = a.shape
-    N, _ = b_quant.shape
-
-    # Output tensor
-    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-    
-    # Transpose weights for coalesced memory access
-    b_quant_t = b_quant.T.contiguous()
-
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),)
-    
-    w8a16_matmul_kernel[grid](
-        a, b_quant_t, c,
-        M, N, K,
-        a.stride(0), a.stride(1),
-        b_quant_t.stride(0), b_quant_t.stride(1),
-        c.stride(0), c.stride(1),
+def triton_rope(q, cos, sin):
+    n_rows, dim = q.shape
+    BLOCK_SIZE = triton.next_power_of_2(dim)
+    _rope_kernel[(n_rows,)](
+        q, cos, sin,
+        q.stride(0), q.stride(1),
+        cos.stride(0), cos.stride(1),
+        1, dim,
+        BLOCK_SIZE=BLOCK_SIZE
     )
-    
-    # Dequantize the output
-    return c * b_scale.T
+    return q

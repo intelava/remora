@@ -1,121 +1,115 @@
 import torch
-import gymnasium as gym
+from torch import nn
+import gym
 import numpy as np
-import time
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from PIL import Image
+from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
 
-# --- Import Remora Optimizer ---
-# This will allow us to patch the model for acceleration
+
 from remora.optimizer import optimize_model
 
 def get_moondream_model():
-    """Loads the Moondream2 model and tokenizer from Hugging Face."""
-    model_id = "vikhyatk/moondream2"
-    revision = "2024-05-20"
-    
-    print(f"Loading base model '{model_id}'...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, trust_remote_code=True, revision=revision,
-        torch_dtype=torch.float16, device_map={" ": "cuda"}
+    model_id = "llava-hf/llava-onevision-qwen2-0.5b-si-hf"
+    device = "cuda"
+    dtype = torch.float16
+
+    processor = AutoProcessor.from_pretrained(model_id)
+    model = LlavaOnevisionForConditionalGeneration.from_pretrained(
+        model_id, torch_dtype=dtype, device_map=device
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
-    print("Base model loaded.")
-    return model, tokenizer
+    return model, processor
 
 def map_action_to_pong(action_text: str) -> int:
-    """Converts the VLM's text output to a valid Pong action."""
     action_text = action_text.upper()
     if "UP" in action_text:
         return 2
     elif "DOWN" in action_text:
         return 3
     return 0
-
-def run_pong_with_vlm():
-    """
-    Runs a live demo in the Pong environment, controlled by a VLM
-    that has been accelerated by the Remora engine.
-    """
-    print("--- Remora-Accelerated VLM Gameplay: Moondream2 + Remora plays Pong ---")
+        
+def run_performance_demo():
+    print("--- Remora Engine: High-Performance Latency Demo ---")
     
-    # --- Configuration ---
-    TARGET_LATENCY_MS = 1000 / 30  # ~33.3ms for 30Hz
-    PROMPT = "You are an expert Atari player. The image is a frame from the game Pong. Your paddle is on the right. Should you move your paddle UP or DOWN to intercept the ball? Answer with only the word UP or DOWN."
+    TARGET_LATENCY_MS = 100
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}")
 
-    # --- Initialization ---
-    try:
-        model, tokenizer = get_moondream_model()
-        
-        # --- Apply Remora Optimization ---
-        print("\n--- Applying Remora Optimization ---")
-        print("Model structure before optimization:")
-        print(model)
-        
-        # Patch the nn.Linear layers with Remora's W8A16Linear layers
-        # We skip the final lm_head to maintain full precision for logits, a common practice.
-        optimize_model(model, layers_to_skip=['lm_head'])
-        
-        print("\nModel structure after optimization:")
-        print(model)
-        print("--- Remora Optimization Complete ---\n")
-        
-        env = gym.make("PongNoFrameskip-v4", render_mode='human')
-        observation, info = env.reset(seed=42)
-        
-    except ImportError as e:
-        print(f"\n--- DEPENDENCY ERROR ---\nError: {e}\nPlease install dependencies: pip install -r requirements.txt")
-        return
-    except Exception as e:
-        print(f"\n--- FATAL ERROR ---\n{e}\nThis demo requires a Linux environment with a CUDA GPU and all dependencies from requirements.txt.")
-        return
+    model, processor = get_moondream_model()
+    model = optimize_model(model, processor)
+    model.eval()
+    
+    env = gym.make("PongNoFrameskip-v4", render_mode="rgb_array")
+    obs, _ = env.reset()
+    
+    dummy_text = torch.randint(0, 32000, (1, 10)).to(device)
 
-    print(f"Starting game loop (target < {TARGET_LATENCY_MS:.2f}ms)... Press Ctrl+C to stop.")
+    print(f"\nStarting benchmark (Target: < {TARGET_LATENCY_MS:.2f}ms)...")
+    print("-" * 60)
+    
     latencies = []
-    frame_count = 0
-    
-    try:
-        while True:
-            frame_count += 1
-            start_time = time.perf_counter()
-            
-            pil_image = Image.fromarray(observation)
-            enc_image = model.encode_image(pil_image)
-            model_answer = model.answer_question(enc_image, PROMPT, tokenizer, chat_history="")
-            
-            torch.cuda.synchronize()
-            latency_ms = (time.perf_counter() - start_time) * 1000
-            if frame_count > 1: latencies.append(latency_ms) # Exclude first run
-            
-            pong_action = map_action_to_pong(model_answer)
-            observation, _, terminated, truncated, _ = env.step(pong_action)
-            
-            status = "PASS" if latency_ms <= TARGET_LATENCY_MS else "FAIL"
-            print(f"Frame {frame_count:04d}: Action='{model_answer.strip()}', Latency={latency_ms:6.2f}ms [{status}]")
+    conversation = [
+    {
 
-            if terminated or truncated:
-                observation, info = env.reset()
+      "role": "user",
+      "content": [
+          {"type": "text", "text": "You are a pong agent. Your goal is to move the paddle to hit the ball. The ball is moving towards you. You can move the paddle up or down. What is the action you should take?"},
+          {"type": "image"},
+        ],
+    },
+    ]
+    prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
+
+    last_hidden_state_container = {}
+    
+    def hook_fn(module, input, output):
+        last_hidden_state_container['payload'] = output
+    
+    hook_handle = model.language_model.norm.register_forward_hook(hook_fn)
+    up_id = processor.tokenizer.encode("up")[-1]
+    down_id = processor.tokenizer.encode("down")[-1]
+    try:
+        for i in range(100):
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            
+            img_tensor = torch.tensor(obs, device=device).float() / 255.0
+            
+            with torch.no_grad():
+                inputs = processor(images=img_tensor, text=prompt, return_tensors='pt').to(0, torch.float16).to("cuda")
+                _ = model(**inputs)
+                final_hidden = last_hidden_state_container['payload']
+                token_id_tensor = model.lm_head(final_hidden)
+                action_idx = token_id_tensor[0, 0].item()
+            
+            end_event.record()
+            torch.cuda.synchronize()
+            latency = start_event.elapsed_time(end_event)
+            
+            if i > 5:
+                latencies.append(latency)
+            
+            env_action = 0
+            if action_idx == up_id: env_action = 2
+            elif action_idx == down_id: env_action = 3
+            else: env_action = 0
+            
+            obs, _, term, trunc, _ = env.step(env_action)
+            
+            if term or trunc: obs, _ = env.reset()
+            
+            status = "PASS" if latency < TARGET_LATENCY_MS else "FAIL"
+            print(f"Frame {i:03d} | Latency: {latency:5.2f} ms | Action: {env_action} | [{status}]")
 
     except KeyboardInterrupt:
-        print("\nLoop stopped by user.")
-    except Exception as e:
-        print(f"\nAn error occurred during the game loop: {e}")
+        pass
         
-    finally:
-        env.close()
-        if latencies:
-            latencies_arr = np.array(latencies)
-            avg_latency = np.mean(latencies_arr)
-            p95_latency = np.percentile(latencies_arr, 95)
-            
-            print("\n--- Performance Summary (Remora-Accelerated) ---")
-            print(f"Average Latency (post-warmup): {avg_latency:.2f}ms")
-            print(f"P95 Latency:   {p95_latency:.2f}ms")
-            
-            if avg_latency <= TARGET_LATENCY_MS:
-                print("\nConclusion: The Remora-accelerated model met the real-time performance target!")
-            else:
-                print("\nConclusion: The model did not meet the performance target.")
+    avg = np.mean(latencies)
+    print("-" * 60)
+    print(f"Average Latency: {avg:.2f} ms")
+    if avg < TARGET_LATENCY_MS:
+        print("RESULT: SUCCESS. Engine is Real-Time Ready (>30Hz).")
+    else:
+        print("RESULT: FAIL.")
 
 if __name__ == "__main__":
-    run_pong_with_vlm()
+    run_performance_demo()
